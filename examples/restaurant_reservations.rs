@@ -27,37 +27,39 @@ pub enum Response {
 
 #[derive(Debug, Error)]
 pub enum RestaurantError {
-    #[error("Reservation ID {id} does not exist")]
-    ReservationNotFound { id: u32 },
+    #[error("Reservation ID {reservation_id} does not exist")]
+    ReservationNotFound { reservation_id: u32 },
 
     #[error("Channel closed unexpectedly")]
     ChannelClosed,
 
     #[error("Invalid request: {reason}")]
     InvalidRequest { reason: String },
+
+    #[error("Table {id} is already reserved")]
+    TableAlreadyReserved { id: u32 },
 }
 
 #[derive(Clone)]
 struct WaitingState {
-    reservations: Arc<Mutex<HashMap<u32, u32>>>, // reservation_id -> table_id
     waiting_queues: Arc<Mutex<HashMap<u32, VecDeque<oneshot::Sender<()>>>>>, // table_id -> waiting requests
-    next_reservation_id: Arc<Mutex<u32>>,
 }
 
 impl WaitingState {
     fn new() -> Self {
         Self {
-            reservations: Arc::new(Mutex::new(HashMap::new())),
             waiting_queues: Arc::new(Mutex::new(HashMap::new())),
-            next_reservation_id: Arc::new(Mutex::new(1)),
         }
     }
 
-    fn get_next_reservation_id(&self) -> u32 {
-        let mut id = self.next_reservation_id.lock().unwrap();
-        let current = *id;
-        *id += 1;
-        current
+    fn add_to_waiting_queue(&self, table_id: u32) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        let mut waiting_queues = self.waiting_queues.lock().unwrap();
+        waiting_queues
+            .entry(table_id)
+            .or_insert_with(VecDeque::new)
+            .push_back(tx);
+        rx
     }
 
     fn process_waiting_requests(&self, table_id: u32) {
@@ -127,76 +129,50 @@ where
                     table_id,
                     client_id,
                 } => {
-                    let is_table_reserved = {
-                        let reservations = state.reservations.lock().unwrap();
-                        reservations.values().any(|&id| id == table_id)
-                    };
+                    // First try to reserve through the inner service
+                    let response = inner.call(req.clone()).await;
 
-                    if is_table_reserved {
-                        // Table is reserved, add to waiting queue
-                        let (tx, rx) = oneshot::channel();
-                        {
-                            let mut waiting_queues = state.waiting_queues.lock().unwrap();
-                            waiting_queues
-                                .entry(table_id)
-                                .or_insert_with(VecDeque::new)
-                                .push_back(tx);
-                        }
+                    // If the table is already reserved, add to waiting queue
+                    if let Err(RestaurantError::TableAlreadyReserved { .. }) = response {
+                        let rx = state.add_to_waiting_queue(table_id);
                         info!("Client {} waiting for table {}", client_id, table_id);
 
-                        // Wait for the response
+                        // Wait for the table to be available
                         rx.await.map_err(|_| RestaurantError::ChannelClosed)?;
+
+                        // Try reservation again
+                        inner.call(req).await
+                    } else {
+                        response
                     }
-                    // Table is available, proceed with reservation
-                    let reservation_id = state.get_next_reservation_id();
-                    let response = Response::Reserved { reservation_id };
-                    let mut reservations = state.reservations.lock().unwrap();
-                    reservations.insert(reservation_id, table_id);
-                    info!(
-                        "Reserving table {} for client {} with ID {}",
-                        table_id, client_id, reservation_id
-                    );
-                    Ok(response)
                 }
                 Request::Release { reservation_id } => {
-                    if !state
-                        .reservations
-                        .lock()
-                        .unwrap()
-                        .contains_key(&reservation_id)
-                    {
-                        warn!(
-                            "Attempted to release non-existent reservation {}",
-                            reservation_id
-                        );
-                        return Err(RestaurantError::ReservationNotFound { id: reservation_id });
+                    let response = inner.call(req.clone()).await;
+
+                    // If release was successful, process waiting requests
+                    if let Ok(Response::Released) = response {
+                        state.process_waiting_requests(reservation_id);
                     }
 
-                    let response = inner.call(req.clone()).await?;
-                    if let Response::Released = response {
-                        let table_id = {
-                            let mut reservations = state.reservations.lock().unwrap();
-                            reservations.remove(&reservation_id)
-                        };
-
-                        if let Some(table_id) = table_id {
-                            state.process_waiting_requests(table_id);
-                        }
-                    }
-                    Ok(response)
+                    response
                 }
             }
         })
     }
 }
 
-/// Restaurant service
 #[derive(Clone)]
-struct RestaurantService;
+struct RestaurantService {
+    reservations: Arc<Mutex<HashMap<u32, u32>>>, // reservation_id -> table_id
+    next_reservation_id: Arc<Mutex<u32>>,
+}
 
 impl RestaurantService {
     fn new() -> Self {
-        Self
+        Self {
+            reservations: Arc::new(Mutex::new(HashMap::new())),
+            next_reservation_id: Arc::new(Mutex::new(1)),
+        }
     }
 }
 
@@ -210,14 +186,52 @@ impl Service<Request> for RestaurantService {
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
+        let reservations = self.reservations.clone();
+        let next_reservation_id = self.next_reservation_id.clone();
+
         Box::pin(async move {
             match req {
-                Request::Reserve { .. } => {
-                    // The actual reservation ID is now handled by the ReservationService
-                    Ok(Response::Released) // This response is not used
+                Request::Reserve {
+                    table_id,
+                    client_id,
+                } => {
+                    let is_table_reserved = {
+                        let reservations = reservations.lock().unwrap();
+                        reservations.values().any(|&id| id == table_id)
+                    };
+
+                    if is_table_reserved {
+                        return Err(RestaurantError::TableAlreadyReserved { id: table_id });
+                    }
+
+                    let reservation_id = {
+                        let mut id = next_reservation_id.lock().unwrap();
+                        let current = *id;
+                        *id += 1;
+                        current
+                    };
+
+                    let mut reservations = reservations.lock().unwrap();
+                    reservations.insert(reservation_id, table_id);
+                    info!(
+                        "Reserving table {} for client {} with ID {}",
+                        table_id, client_id, reservation_id
+                    );
+
+                    Ok(Response::Reserved { reservation_id })
                 }
                 Request::Release { reservation_id } => {
-                    info!("Releasing reservation {}", reservation_id);
+                    let mut reservations = reservations.lock().unwrap();
+                    if !reservations.contains_key(&reservation_id) {
+                        warn!(
+                            "Attempted to release non-existent reservation {}",
+                            reservation_id
+                        );
+                        return Err(RestaurantError::ReservationNotFound { reservation_id });
+                    }
+
+                    reservations.remove(&reservation_id);
+                    info!("Released reservation {}", reservation_id);
                     Ok(Response::Released)
                 }
             }
@@ -261,5 +275,4 @@ async fn main() {
     println!("{:?}", reserve2.await);
     println!("{:?}", reserve3.await);
     println!("{:?}", delayed_release2.await.unwrap());
-
 }
