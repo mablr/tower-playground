@@ -195,30 +195,25 @@ impl Service<Request> for RestaurantService {
                     table_id,
                     client_id,
                 } => {
-                    let is_table_reserved = {
-                        let reservations = reservations.lock().unwrap();
-                        reservations.values().any(|&id| id == table_id)
-                    };
+                    // Check if the table is already reserved
+                    if reservations.lock().unwrap().values().any(|&id| id == table_id) {
+                        Err(RestaurantError::TableAlreadyReserved { id: table_id })
+                    } else {
+                        let reservation_id = {
+                            let mut id = next_reservation_id.lock().unwrap();
+                            let current = *id;
+                            *id += 1;
+                            current
+                        };
 
-                    if is_table_reserved {
-                        return Err(RestaurantError::TableAlreadyReserved { id: table_id });
+                        let mut reservations = reservations.lock().unwrap();
+                        reservations.insert(reservation_id, table_id);
+                        info!(
+                            "Reserving table {} for client {} with ID {}",
+                            table_id, client_id, reservation_id
+                        );
+                        Ok(Response::Reserved { reservation_id })
                     }
-
-                    let reservation_id = {
-                        let mut id = next_reservation_id.lock().unwrap();
-                        let current = *id;
-                        *id += 1;
-                        current
-                    };
-
-                    let mut reservations = reservations.lock().unwrap();
-                    reservations.insert(reservation_id, table_id);
-                    info!(
-                        "Reserving table {} for client {} with ID {}",
-                        table_id, client_id, reservation_id
-                    );
-
-                    Ok(Response::Reserved { reservation_id })
                 }
                 Request::Release { reservation_id } => {
                     let mut reservations = reservations.lock().unwrap();
@@ -227,12 +222,12 @@ impl Service<Request> for RestaurantService {
                             "Attempted to release non-existent reservation {}",
                             reservation_id
                         );
-                        return Err(RestaurantError::ReservationNotFound { reservation_id });
+                        Err(RestaurantError::ReservationNotFound { reservation_id })
+                    } else {
+                        reservations.remove(&reservation_id);
+                        info!("Released reservation {}", reservation_id);
+                        Ok(Response::Released)
                     }
-
-                    reservations.remove(&reservation_id);
-                    info!("Released reservation {}", reservation_id);
-                    Ok(Response::Released)
                 }
             }
         })
