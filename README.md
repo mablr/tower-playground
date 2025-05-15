@@ -7,5 +7,5 @@ This layered service pattern is also the foundation of [Hyper](https://github.co
 ## Getting Started
 
 ```bash
-cargo run --example layers
+cargo run --example echo_auth_timing
 ```
