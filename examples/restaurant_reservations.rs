@@ -196,7 +196,12 @@ impl Service<Request> for RestaurantService {
                     client_id,
                 } => {
                     // Check if the table is already reserved
-                    if reservations.lock().unwrap().values().any(|&id| id == table_id) {
+                    if reservations
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .any(|&id| id == table_id)
+                    {
                         Err(RestaurantError::TableAlreadyReserved { id: table_id })
                     } else {
                         let reservation_id = {
