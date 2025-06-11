@@ -4,8 +4,15 @@ A collection of examples demonstrating how to create layered services with the [
 
 This layered service pattern is also the foundation of [Hyper](https://github.com/hyperium/hyper) and [Tonic](https://github.com/hyperium/tonic) frameworks.
 
-## Getting Started
+## Examples
 
 ```bash
+# Echo server with auth and timing middleware
 cargo run --example echo_auth_timing
+
+# IO mediation example
+cargo run --example io_mediation
+
+# Restaurant reservation system
+cargo run --example restaurant_reservations
 ```
